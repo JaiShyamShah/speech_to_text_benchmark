@@ -1,0 +1,6 @@
+scripts/.env
+audio_dataset/
+model_checkpoints/
+pretrained_models/
+*.pt
+*.bin

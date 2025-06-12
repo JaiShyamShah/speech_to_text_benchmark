@@ -1,0 +1,12 @@
+pandas
+datasets
+transformers
+jiwer
+torch
+torchaudio
+audiomentations
+tqdm
+python-dotenv
+tenacity
+requests
+nemo_toolkit[asr]
