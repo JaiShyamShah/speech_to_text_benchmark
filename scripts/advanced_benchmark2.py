@@ -1,18 +1,21 @@
+# This script benchmarks the Granite Speech model on a specified dataset, comparing clean and noisy audio inputs with temp 0.3 meant for pass3.
+# It processes audio data, applies augmentations, and computes WER metrics for the transcriptions.  
 import os
 import random
 import pandas as pd
 from datasets import load_dataset
-from transformers import WhisperProcessor, WhisperForConditionalGeneration, Wav2Vec2Processor, Wav2Vec2ForCTC
-from jiwer import wer, Compose, RemovePunctuation, ToLowerCase
+from jiwer import wer, Compose, RemovePunctuation, ToLowerCase, compute_measures
 import torch
 import torchaudio
 import asyncio
 import logging
 import warnings
 import numpy as np
-from audiomentations import Compose as AudioCompose, AddGaussianNoise, TimeStretch, PitchShift
 from tqdm import tqdm
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+from audiomentations import Compose as AudioCompose, AddGaussianNoise, TimeStretch, PitchShift
 
+# Set seed
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -24,147 +27,254 @@ set_seed(42)
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using device: {DEVICE}")
-
 text_transform = Compose([RemovePunctuation(), ToLowerCase()])
 
-class AudioAugmentGPU:
+# Augmentation pipeline
+class AudioAugment:
     def __init__(self):
-        self.noise = AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=1.0)
-        self.stretch = TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5)
-        self.pitch = PitchShift(min_semitones=-4, max_semitones=4, p=0.5)
+        self.augment = AudioCompose([
+            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=1.0),
+            TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5),
+            PitchShift(min_semitones=-4, max_semitones=4, p=0.5)
+        ])
+
     def __call__(self, waveform, sample_rate):
-        waveform = self.noise(waveform, sample_rate)
-        if np.random.rand() < 0.5:
-            waveform = self.stretch(waveform, sample_rate)
-        if np.random.rand() < 0.5:
-            waveform = self.pitch(waveform, sample_rate)
-        return waveform
+        return self.augment(waveform, sample_rate)
 
-augment = AudioAugmentGPU()
+augment = AudioAugment()
 
-class WhisperWrapper:
-    def __init__(self, model_name="openai/whisper-small"):
-        self.processor = WhisperProcessor.from_pretrained(model_name)
-        self.model = WhisperForConditionalGeneration.from_pretrained(model_name).to(DEVICE)
-        self.resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000).to(DEVICE)
-    def process_batch(self, waveforms, sample_rates, temperature=0.3):
-        processed = []
-        for wav, sr in zip(waveforms, sample_rates):
-            wav = wav.to(DEVICE)
-            if sr != 16000:
-                wav = self.resampler(wav)
-            processed.append(wav.squeeze().cpu().numpy())
-        inputs = self.processor(
-            processed, 
-            sampling_rate=16000, 
-            return_tensors="pt", 
-            padding=True,
-            return_attention_mask=True
-        ).input_features.to(DEVICE)
-        if inputs.shape[-1] < 3000:
-            inputs = torch.nn.functional.pad(inputs, (0, 3000 - inputs.shape[-1]))
-        with torch.no_grad():
-            outputs = self.model.generate(inputs, temperature=temperature)
-        return self.processor.batch_decode(outputs, skip_special_tokens=True)
+class GraniteWrapper:
+    def __init__(self, model_name="ibm-granite/granite-speech-3.3-8b"):
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.tokenizer = self.processor.tokenizer
+        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            trust_remote_code=True  # Required for Granite models
+        )
+        self.model.eval()
+        self.sampling_rate = 16000  # Granite 3.3.1 expects 16kHz input
+        
+        # System prompt for the chat template
+        self.system_prompt = (
+            "Knowledge Cutoff Date: April 2024.\n"
+            "Today's Date: June 14, 2025.\n"
+            "You are Granite, developed by IBM. You are a helpful AI assistant"
+        )
 
-class Wav2Vec2Wrapper:
-    def __init__(self, model_name="facebook/wav2vec2-large-960h-lv60-self"):
-        self.processor = Wav2Vec2Processor.from_pretrained(model_name)
-        self.model = Wav2Vec2ForCTC.from_pretrained(model_name).to(DEVICE)
-        self.resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000).to(DEVICE)
+    def create_chat_prompt(self, transcription_request="can you transcribe the speech into a written format?"):
+        """Create the chat template required by Granite Speech"""
+        chat = [
+            {
+                "role": "system",
+                "content": self.system_prompt,
+            },
+            {
+                "role": "user",
+                "content": f"<|audio|>{transcription_request}",
+            }
+        ]
+        return self.tokenizer.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=True
+        )
+
     def process_batch(self, waveforms, sample_rates):
-        processed = []
+        processed_results = []
+        
+        # Process each audio individually due to chat template requirements
         for wav, sr in zip(waveforms, sample_rates):
-            wav = wav.to(DEVICE)
-            if sr != 16000:
-                wav = self.resampler(wav)
-            processed.append(wav.squeeze().cpu().numpy())
-        inputs = self.processor(
-            processed, 
-            sampling_rate=16000, 
-            return_tensors="pt", 
-            padding=True
-        ).input_values.to(DEVICE)
-        with torch.no_grad():
-            logits = self.model(inputs).logits
-            pred_ids = torch.argmax(logits, dim=-1)
-        return self.processor.batch_decode(pred_ids)
+            try:
+                # Ensure mono channel and correct sample rate
+                if wav.dim() > 1:
+                    wav = wav.mean(dim=0, keepdim=True)  # Convert to mono
+                if wav.dim() == 1:
+                    wav = wav.unsqueeze(0)  # Add channel dimension
+                
+                if sr != self.sampling_rate:
+                    wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=self.sampling_rate)
+                
+                # Ensure audio is at least 0.1s to avoid hallucination issues
+                min_length = int(0.1 * self.sampling_rate)  # 0.1 seconds
+                if wav.shape[1] < min_length:
+                    # Pad with zeros if too short
+                    pad_length = min_length - wav.shape[1]
+                    wav = torch.nn.functional.pad(wav, (0, pad_length))
+                
+                # Create chat prompt
+                text_prompt = self.create_chat_prompt()
+                
+                # Process with the model
+                model_inputs = self.processor(
+                    text_prompt,
+                    wav,
+                    device=DEVICE,
+                    return_tensors="pt",
+                ).to(self.model.device)
+                
+                with torch.no_grad():
+                    model_outputs = self.model.generate(
+                        **model_inputs,
+                        max_new_tokens=200,
+                        num_beams=4,  # Use beam search as recommended
+                        do_sample=True,  # Enable sampling for temperature
+                        min_length=1,
+                        top_p=0.9,  # Adjusted for better sampling
+                        repetition_penalty=1.1,  # Slight penalty to avoid repetition
+                        length_penalty=1.0,
+                        temperature=0.3,  # Set temperature to 0.3
+                        bos_token_id=self.tokenizer.bos_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                    )
+                
+                # Extract only the new tokens (response)
+                num_input_tokens = model_inputs["input_ids"].shape[-1]
+                new_tokens = model_outputs[0, num_input_tokens:]
+                
+                # Decode the response
+                output_text = self.tokenizer.decode(
+                    new_tokens, 
+                    skip_special_tokens=True
+                ).strip()
+                
+                processed_results.append(output_text)
+                
+            except Exception as e:
+                logger.error(f"Error processing audio: {e}")
+                processed_results.append("")  # Return empty string on error
+        
+        return processed_results
 
-whisper_model = WhisperWrapper()
-distil_whisper_model = WhisperWrapper("distil-whisper/distil-large-v3")
-wav2vec2_model = Wav2Vec2Wrapper()
+granite_model = GraniteWrapper()
 
 async def benchmark_dataset(
     dataset_name="jaishah2808/speech-to-text-benchmark",
-    batch_size=16,
+    batch_size=4,  # Reduced batch size due to individual processing
     max_samples=None,
-    temperature=0.3,
     run_idx=1
 ):
-    set_seed(42)
-    dataset = load_dataset(dataset_name)
-    train_dataset = dataset['train']
-    dataset_size = len(train_dataset)
-    logger.info(f"Train dataset size: {dataset_size}")
-    if max_samples:
-        n_samples = min(max_samples, dataset_size)
-        samples = train_dataset.select(range(n_samples))
-    else:
-        samples = train_dataset
+    set_seed(random.randint(0, 99999))
+    
+    try:
+        dataset = load_dataset(dataset_name)
+        samples = dataset['train']
+        if max_samples:
+            samples = samples.select(range(min(len(samples), max_samples)))
+    except Exception as e:
+        logger.error(f"Error loading dataset: {e}")
+        return
+
     logger.info("Preloading audio data...")
     clean_waveforms, noisy_waveforms, sample_rates, texts = [], [], [], []
-    for example in tqdm(samples, desc="Preprocessing"):
-        audio = example["audio"]
-        waveform = torch.tensor(audio["array"], dtype=torch.float32)
-        sr = audio["sampling_rate"]
-        if DEVICE == "cuda":
-            waveform = waveform.cuda()
-        clean_waveforms.append(waveform)
-        noisy_waveforms.append(torch.tensor(augment(waveform.cpu().numpy(), sr)).to(DEVICE))
-        sample_rates.append(sr)
-        texts.append(example["text"])
+
+    for ex in tqdm(samples, desc="Preprocessing"):
+        try:
+            arr, sr = ex["audio"]["array"], ex["audio"]["sampling_rate"]
+            wav = torch.tensor(arr, dtype=torch.float32)
+            
+            # Ensure correct shape
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)  # Add channel dimension if missing
+                
+            clean_waveforms.append(wav)
+            sample_rates.append(sr)
+            texts.append(ex["text"])
+
+            # Apply augmentations
+            wav_np = wav.squeeze().cpu().numpy() if wav.dim() > 1 else wav.cpu().numpy()
+            noisy_np = augment(wav_np, sr)
+            noisy_wav = torch.tensor(noisy_np, dtype=torch.float32)
+            if noisy_wav.dim() == 1:
+                noisy_wav = noisy_wav.unsqueeze(0)
+            noisy_waveforms.append(noisy_wav)
+            
+        except Exception as e:
+            logger.error(f"Error preprocessing sample: {e}")
+            continue
+
     results = []
-    model_funcs = {
-        "whisper": lambda x, y: whisper_model.process_batch(x, y, temperature=temperature),
-        "distil_whisper": lambda x, y: distil_whisper_model.process_batch(x, y, temperature=temperature),
-        "wav2vec2": wav2vec2_model.process_batch,
-    }
-    for model_name, model_fn in model_funcs.items():
-        logger.info(f"Processing {model_name} in batches...")
-        clean_preds = []
-        for i in tqdm(range(0, len(clean_waveforms), batch_size), desc=f"{model_name} clean"):
-            batch = clean_waveforms[i:i+batch_size]
-            sr_batch = sample_rates[i:i+batch_size]
-            clean_preds.extend(model_fn(batch, sr_batch))
-        noisy_preds = []
-        for i in tqdm(range(0, len(noisy_waveforms), batch_size), desc=f"{model_name} noisy"):
-            batch = noisy_waveforms[i:i+batch_size]
-            sr_batch = sample_rates[i:i+batch_size]
-            noisy_preds.extend(model_fn(batch, sr_batch))
-        for i, (text, pred_clean, pred_noisy) in enumerate(zip(texts, clean_preds, noisy_preds)):
-            results.append({
-                "model": model_name,
-                "category": "clean",
-                "wer": wer(text_transform(text), text_transform(pred_clean)),
-                "transcription": pred_clean
-            })
-            results.append({
-                "model": model_name,
-                "category": "noisy",
-                "wer": wer(text_transform(text), text_transform(pred_noisy)),
-                "transcription": pred_noisy
-            })
+
+    for mode, wf_list in [("clean", clean_waveforms), ("noisy", noisy_waveforms)]:
+        logger.info(f"Processing {mode} audio...")
+        preds = []
+        
+        for i in tqdm(range(0, len(wf_list), batch_size), desc=f"granite {mode}"):
+            batch = wf_list[i:i + batch_size]
+            sr_batch = sample_rates[i:i + batch_size]
+            
+            try:
+                batch_preds = granite_model.process_batch(batch, sr_batch)
+                preds.extend(batch_preds)
+            except Exception as e:
+                logger.error(f"Error processing batch: {e}")
+                # Add empty predictions for failed batch
+                preds.extend([""] * len(batch))
+
+        # Ensure we have predictions for all texts
+        min_len = min(len(texts), len(preds))
+        texts_subset = texts[:min_len]
+        preds_subset = preds[:min_len]
+
+        for text, pred in zip(texts_subset, preds_subset):
+            try:
+                ref = text_transform(text)
+                hyp = text_transform(pred) if pred else ""
+                measures = compute_measures(ref, hyp)
+                results.append({
+                    "model": "granite-speech-3.3",
+                    "category": mode,
+                    "true_transcription": text,
+                    "transcription": pred,
+                    "wer": measures['wer'],
+                    "insertions": measures['insertions'],
+                    "deletions": measures['deletions'],
+                    "substitutions": measures['substitutions']
+                })
+            except Exception as e:
+                logger.error(f"Error computing WER: {e}")
+                results.append({
+                    "model": "granite-speech-3.3",
+                    "category": mode,
+                    "true_transcription": text,
+                    "transcription": pred,
+                    "wer": 1.0,  # Maximum WER for failed cases
+                    "insertions": 0,
+                    "deletions": len(text.split()) if text else 0,
+                    "substitutions": 0
+                })
+
     df = pd.DataFrame(results)
-    out_csv = f"gpu_optimized_results_run{run_idx}.csv"
+    out_csv = f"granite_speech_benchmark_run{run_idx}.csv"
     df.to_csv(out_csv, index=False)
     logger.info(f"Results saved to {out_csv}")
-    print(df.groupby(['model', 'category']).wer.mean().unstack())
+    
+    # Print summary statistics
+    try:
+        summary = df.groupby(['model', 'category']).agg({
+            'wer': ['mean', 'std', 'min', 'max'],
+            'insertions': 'mean',
+            'deletions': 'mean',
+            'substitutions': 'mean'
+        }).round(4)
+        print("\n=== BENCHMARK RESULTS ===")
+        print(summary)
+        print(f"\nMean WER by category:")
+        print(df.groupby(['model', 'category'])['wer'].mean().unstack().round(4))
+    except Exception as e:
+        logger.error(f"Error computing summary: {e}")
 
 if __name__ == "__main__":
+    # Enable optimizations
     torch.backends.cudnn.benchmark = True
+    
     for run in range(1, 4):
         print(f"\n=== RUN {run} ===")
-        asyncio.run(benchmark_dataset(batch_size=16, max_samples=100, temperature=0.3, run_idx=run))
+        try:
+            asyncio.run(benchmark_dataset(batch_size=4, max_samples=100, run_idx=run))
+        except Exception as e:
+            logger.error(f"Error in run {run}: {e}")
+            continue
+
